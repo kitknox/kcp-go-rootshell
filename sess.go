@@ -160,6 +160,13 @@ type (
 		// packets waiting to be sent on wire
 		chPostProcessing chan sendRequest
 
+		// updaterParked is 1 while the periodic update() loop has parked
+		// itself because the session is idle (nothing awaiting
+		// retransmission, no zero-window probing, no pending ACKs).
+		// kickUpdater() re-arms the loop. The park decision is made under
+		// mu; the flag itself is accessed with atomics.
+		updaterParked int32
+
 		// platform-dependent optimizations
 		platform platform
 
@@ -312,6 +319,9 @@ RESET_TIMER:
 			if len(b) >= size {
 				s.kcp.Recv(b)
 				s.mu.Unlock()
+				// Recv can schedule a window-update probe (IKCP_ASK_TELL)
+				// on fast recover; make sure a parked updater flushes it.
+				s.kickUpdater()
 				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 				return size, nil
 			}
@@ -330,6 +340,8 @@ RESET_TIMER:
 			s.bufptr = s.recvbuf[n:] // pointer update
 
 			s.mu.Unlock()
+			// see the DMA path above: Recv can schedule a window-update probe
+			s.kickUpdater()
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
@@ -421,6 +433,9 @@ RESET_TIMER:
 				s.kcp.flush(IKCP_FLUSH_FULL)
 			}
 			s.mu.Unlock()
+			// data is now queued in kcp; restart the parked update loop so
+			// retransmission timers run until everything is acknowledged.
+			s.kickUpdater()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
 		}
@@ -809,9 +824,30 @@ func (s *UDPSession) update() {
 		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
+		// Park the loop when the session is fully idle: nothing awaiting
+		// (re)transmission, remote window open (no zero-window probing due),
+		// no probe request pending, and all ACKs flushed. An idle session
+		// otherwise burns a timer wakeup every `interval` ms forever.
+		// kickUpdater() re-arms the loop from the write/input/read paths.
+		// Parking under mu guarantees any concurrent state change happens
+		// after the flag is visible and therefore kicks.
+		if waitsnd == 0 && s.kcp.rmt_wnd > 0 && s.kcp.probe == 0 && len(s.kcp.acklist) == 0 {
+			atomic.StoreInt32(&s.updaterParked, 1)
+			s.mu.Unlock()
+			return
+		}
 		s.mu.Unlock()
 		// self-synchronized timed scheduling
 		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+	}
+}
+
+// kickUpdater re-arms the update() loop if it parked itself idle. Call after
+// releasing s.mu, once the state that needs flushing is in place. A single
+// CAS guards against double-scheduling.
+func (s *UDPSession) kickUpdater() {
+	if atomic.CompareAndSwapInt32(&s.updaterParked, 1, 0) {
+		SystemTimedSched.Put(s.update, time.Now())
 	}
 }
 
@@ -1012,6 +1048,9 @@ func (s *UDPSession) packetInput(data []byte) {
 	}
 
 	s.kcpInput(data)
+	// inbound packets queue ACKs and can change the remote window; restart
+	// the parked update loop to flush them (kcpInput released s.mu on return).
+	s.kickUpdater()
 }
 
 // kcpInput routes a decrypted packet into the KCP state machine,
@@ -1133,6 +1172,9 @@ func (s *UDPSession) ResetRTO() {
 	s.mu.Lock()
 	s.kcp.ResetRTO()
 	s.mu.Unlock()
+	// a parked updater means nothing was pending, but kick defensively so
+	// the documented "next background update tick" is guaranteed to exist
+	s.kickUpdater()
 }
 
 // -----------------------------------------------------------------------
