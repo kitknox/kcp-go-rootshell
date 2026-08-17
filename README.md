@@ -1,3 +1,18 @@
+# kcp-go — rootshell fork
+
+This repository is the [rootshell](https://www.rootshell.com)-maintained fork
+of [trzsz/kcp-go](https://github.com/trzsz/kcp-go). It parks the periodic KCP
+update loop while a session is idle, avoiding unnecessary timer wakeups in
+rootshell's long-lived `tssh` sessions. The fork is maintained independently
+and does not automatically track subsequent upstream changes.
+
+The Go module path and public API remain unchanged. Report rootshell
+application problems in the
+[rootshell issue tracker](https://github.com/kitknox/rootshell/issues); report
+reproducible upstream `kcp-go` problems to the upstream project.
+
+---
+
 <img src="assets/kcp-go.png" alt="kcp-go" height="100px" />
 
 
